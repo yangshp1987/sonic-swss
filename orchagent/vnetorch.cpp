@@ -5,6 +5,8 @@
 #include <unordered_set>
 #include <exception>
 
+#include <sairedis.h>
+
 #include "sai.h"
 #include "saiextensions.h"
 #include "macaddress.h"
@@ -13,7 +15,6 @@
 #include "request_parser.h"
 #include "vnetorch.h"
 #include "vxlanorch.h"
-#include "directory.h"
 #include "swssnet.h"
 #include "intfsorch.h"
 #include "neighorch.h"
@@ -27,8 +28,8 @@ extern sai_fdb_api_t* sai_fdb_api;
 extern sai_neighbor_api_t* sai_neighbor_api;
 extern sai_next_hop_api_t* sai_next_hop_api;
 extern sai_bmtor_api_t* sai_bmtor_api;
-extern sai_object_id_t gSwitchId;
-extern Directory<Orch*> gDirectory;
+extern sai_switch_api_t* sai_switch_api;
+extern sai_acl_api_t *sai_acl_api;
 extern PortsOrch *gPortsOrch;
 extern IntfsOrch *gIntfsOrch;
 extern NeighOrch *gNeighOrch;
@@ -79,10 +80,12 @@ set<sai_object_id_t> VNetVrfObject::getVRids() const
 
 bool VNetVrfObject::createObj(vector<sai_attribute_t>& attrs)
 {
+    sai_object_id_t switch_id = getSwitchId();
+
     auto l_fn = [&] (sai_object_id_t& router_id) {
 
         sai_status_t status = sai_virtual_router_api->create_virtual_router(&router_id,
-                                                                            gSwitchId,
+                                                                            switch_id,
                                                                             static_cast<uint32_t>(attrs.size()),
                                                                             attrs.data());
         if (status != SAI_STATUS_SUCCESS)
@@ -1152,9 +1155,31 @@ bool VNetOrch::setIntf(const string& alias, const string name, const IpPrefix *p
     if (isVnetExecVrf())
     {
         auto *vnet_obj = getTypePtr<VNetVrfObject>(name);
-        sai_object_id_t vrf_id = vnet_obj->getVRidIngress();
+        VNetApplianceOrch* appliance_orch = gDirectory.get<VNetApplianceOrch*>();
+        string appliance = vnet_obj->getApplianceName();
+        if (!appliance.empty() && !appliance_orch->exists(appliance))
+        {
+            SWSS_LOG_WARN("Appliance %s doesn't exist", appliance.c_str());
+            return false;
+        }
 
-        return gIntfsOrch->setIntf(alias, vrf_id, prefix);
+        Port port;
+        if (!gPortsOrch->getPort(alias, port))
+        {
+            SWSS_LOG_ERROR("failed to get port\n");
+            return false;
+        }
+
+        if (!appliance_orch->redirectPortToOverlay(appliance, port))
+        {
+            SWSS_LOG_WARN("Appliance %s doesn't exist", appliance.c_str());
+            return false;
+        }
+
+        /* sai_object_id_t vrf_id = vnet_obj->getVRidIngress(); */
+
+
+        return gIntfsOrch->setIntf(alias, gVirtualRouterId, prefix);
     }
     else
     {
@@ -1173,7 +1198,7 @@ bool VNetOrch::addOperation(const Request& request)
     set<string> peer_list = {};
     bool peer = false, create = false;
     uint32_t vni=0;
-    string tunnel;
+    string tunnel, appliance;
 
     for (const auto& name: request.getAttrFieldNames())
     {
@@ -1197,6 +1222,10 @@ bool VNetOrch::addOperation(const Request& request)
         {
             tunnel = request.getAttrString("vxlan_tunnel");
         }
+        else if (name == "appliance")
+        {
+            appliance = request.getAttrString("appliance");
+        }
         else
         {
             SWSS_LOG_INFO("Unknown attribute: %s", name.c_str());
@@ -1206,6 +1235,14 @@ bool VNetOrch::addOperation(const Request& request)
 
     const std::string& vnet_name = request.getKeyString(0);
     SWSS_LOG_INFO("VNET '%s' add request", vnet_name.c_str());
+
+    VNetApplianceOrch* appliance_orch = gDirectory.get<VNetApplianceOrch*>();
+
+    if (!appliance.empty() && appliance_orch->switch_id(appliance) == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_WARN("Appliance '%s' doesn't exist", appliance.c_str());
+        return false;
+    }
 
     try
     {
@@ -1223,9 +1260,21 @@ bool VNetOrch::addOperation(const Request& request)
 
             if (it == std::end(vnet_table_))
             {
-                VNetInfo vnet_info = { tunnel, vni, peer_list };
+                VNetInfo vnet_info = { tunnel, vni, peer_list, appliance };
                 obj = createObject<VNetVrfObject>(vnet_name, vnet_info, attrs);
                 create = true;
+            }
+
+            if (!appliance.empty())
+            {
+                auto switch_id = appliance_orch->switch_id(appliance);
+                auto loopback_rif = appliance_orch->loopback_rif(appliance);
+                auto *tunnelObj = vxlan_orch->getVxlanTunnel(tunnel);
+                if (!tunnelObj->setSwitch(switch_id, loopback_rif))
+                {
+                    SWSS_LOG_WARN("Failed to set tunnel %s switch id 0x%lx", tunnel.c_str(), switch_id);
+                    return false;
+                }
             }
 
             VNetVrfObject *vrf_obj = dynamic_cast<VNetVrfObject*>(obj.get());
@@ -1250,7 +1299,7 @@ bool VNetOrch::addOperation(const Request& request)
 
             if (it == std::end(vnet_table_))
             {
-                VNetInfo vnet_info = { tunnel, vni, peer_list };
+                VNetInfo vnet_info = { tunnel, vni, peer_list, appliance };
                 obj = createObject<VNetBitmapObject>(vnet_name, vnet_info, attrs);
                 create = true;
             }
@@ -1343,11 +1392,11 @@ bool VNetOrch::delOperation(const Request& request)
  * Vnet Route Handling
  */
 
-static bool del_route(sai_object_id_t vr_id, sai_ip_prefix_t& ip_pfx)
+static bool del_route(sai_object_id_t vr_id, sai_object_id_t switch_id, sai_ip_prefix_t& ip_pfx)
 {
     sai_route_entry_t route_entry;
     route_entry.vr_id = vr_id;
-    route_entry.switch_id = gSwitchId;
+    route_entry.switch_id = switch_id;
     route_entry.destination = ip_pfx;
 
     sai_status_t status = sai_route_api->remove_route_entry(&route_entry);
@@ -1369,11 +1418,11 @@ static bool del_route(sai_object_id_t vr_id, sai_ip_prefix_t& ip_pfx)
     return true;
 }
 
-static bool add_route(sai_object_id_t vr_id, sai_ip_prefix_t& ip_pfx, sai_object_id_t nh_id)
+static bool add_route(sai_object_id_t vr_id, sai_object_id_t switch_id, sai_ip_prefix_t& ip_pfx, sai_object_id_t nh_id)
 {
     sai_route_entry_t route_entry;
     route_entry.vr_id = vr_id;
-    route_entry.switch_id = gSwitchId;
+    route_entry.switch_id = switch_id;
     route_entry.destination = ip_pfx;
 
     sai_attribute_t route_attr;
@@ -1443,17 +1492,18 @@ bool VNetRouteOrch::doRouteTask<VNetVrfObject>(const string& vnet, IpPrefix& ipP
 
     auto *vrf_obj = vnet_orch_->getTypePtr<VNetVrfObject>(vnet);
     sai_ip_prefix_t pfx;
+    sai_object_id_t switch_id = vrf_obj->getSwitchId();
     copy(pfx, ipPrefix);
     sai_object_id_t nh_id = (op == SET_COMMAND)?vrf_obj->getTunnelNextHop(endp):SAI_NULL_OBJECT_ID;
 
     for (auto vr_id : vr_set)
     {
-        if (op == SET_COMMAND && !add_route(vr_id, pfx, nh_id))
+        if (op == SET_COMMAND && !add_route(vr_id, switch_id, pfx, nh_id))
         {
             SWSS_LOG_ERROR("Route add failed for %s, vr_id '0x%lx", ipPrefix.to_string().c_str(), vr_id);
             return false;
         }
-        else if (op == DEL_COMMAND && !del_route(vr_id, pfx))
+        else if (op == DEL_COMMAND && !del_route(vr_id, switch_id, pfx))
         {
             SWSS_LOG_ERROR("Route del failed for %s, vr_id '0x%lx", ipPrefix.to_string().c_str(), vr_id);
             return false;
@@ -1503,6 +1553,7 @@ bool VNetRouteOrch::doRouteTask<VNetVrfObject>(const string& vnet, IpPrefix& ipP
     set<sai_object_id_t> vr_set;
     auto& peer_list = vnet_orch_->getPeerList(vnet);
     auto vr_id = vrf_obj->getVRidIngress();
+    auto switch_id = vrf_obj->getSwitchId();
 
     /*
      * If RIF doesn't belong to this VRF, and if it is a replicated subnet
@@ -1569,12 +1620,12 @@ bool VNetRouteOrch::doRouteTask<VNetVrfObject>(const string& vnet, IpPrefix& ipP
 
     for (auto vr_id : vr_set)
     {
-        if (op == SET_COMMAND && !add_route(vr_id, pfx, nh_id))
+        if (op == SET_COMMAND && !add_route(vr_id, switch_id, pfx, nh_id))
         {
             SWSS_LOG_ERROR("Route add failed for %s", ipPrefix.to_string().c_str());
             break;
         }
-        else if (op == DEL_COMMAND && !del_route(vr_id, pfx))
+        else if (op == DEL_COMMAND && !del_route(vr_id, switch_id, pfx))
         {
             SWSS_LOG_ERROR("Route del failed for %s", ipPrefix.to_string().c_str());
             break;
@@ -1781,6 +1832,202 @@ bool VNetRouteOrch::delOperation(const Request& request)
     {
         SWSS_LOG_ERROR("VNET del operation error %s ", _.what());
         return true;
+    }
+
+    return true;
+}
+
+/*
+ * Vnet Appliance Handling
+ */
+
+VNetApplianceOrch::VNetApplianceOrch(DBConnector *db, vector<string> &tableNames)
+                                  : Orch2(db, tableNames, request_)
+{
+    SWSS_LOG_ENTER();
+
+}
+
+bool VNetApplianceOrch::addOperation(const Request& request)
+{
+    SWSS_LOG_ENTER();
+
+    sai_attribute_t attr;
+    vector<sai_attribute_t> attrs;
+    uint32_t index = 0;
+    VNetApplianceInfo info;
+
+    for (const auto& name: request.getAttrFieldNames())
+    {
+        if (name == "overlay_interface")
+        {
+            info.overlay_intf = request.getAttrString(name);
+        }
+        else if (name == "underlay_interface")
+        {
+            info.underlay_intf = request.getAttrString(name);
+        }
+        else if (name == "index")
+        {
+            index = static_cast<uint32_t>(request.getAttrUint(name));
+        }
+        else
+        {
+            SWSS_LOG_INFO("Unknown attribute: %s", name.c_str());
+            continue;
+        }
+    }
+
+    const std::string& appliance_name = request.getKeyString(0);
+
+    attr.id = SAI_SWITCH_ATTR_INIT_SWITCH;
+    attr.value.booldata = true;
+    attrs.push_back(attr);
+
+    attr.id = SAI_SWITCH_ATTR_SWITCH_HARDWARE_INFO;
+    attr.value.u32 = index;
+    attr.value.s8list.count = 1;
+    attrs.push_back(attr);
+
+    sai_status_t status = sai_switch_api->create_switch(&info.switch_id,
+            (uint32_t)attrs.size(),
+            attrs.data());
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to create a VNet Appliance switch, rv:%d", status);
+        throw std::runtime_error("Failed to create VNet Appliance switch");
+    }
+
+    attrs.clear();
+
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID;
+    attr.value.oid = info.virtual_router_id;
+    attrs.push_back(attr);
+
+    attr.id = SAI_ROUTER_INTERFACE_ATTR_TYPE;
+    attr.value.s32 = SAI_ROUTER_INTERFACE_TYPE_LOOPBACK;
+    attrs.push_back(attr);
+
+    status = sai_router_intfs_api->create_router_interface(
+            &info.underlay_rif_id,
+            info.switch_id,
+            (uint32_t)attrs.size(),
+            attrs.data());
+
+    SWSS_LOG_NOTICE("Created a switch");
+    appliances_.emplace(appliance_name, info);
+
+    return true;
+}
+
+bool VNetApplianceOrch::delOperation(const Request& request)
+{
+    SWSS_LOG_ENTER();
+
+    /* const std::string& appliance_name = request.getKeyString(0); */
+
+    return true;
+}
+
+bool VNetApplianceOrch::redirectPortToOverlay(string appliance, const Port& port)
+{
+    SWSS_LOG_ENTER();
+
+    if (!initAcl())
+    {
+        SWSS_LOG_ERROR("ACL initialization failed");
+    }
+
+    if (appliances_.find(appliance) == appliances_.end())
+    {
+        SWSS_LOG_ERROR("No Such appliance %s\n", appliance.c_str());
+        return false;
+    }
+
+    const auto& appliance_info = appliances_.at(appliance);
+    Port overlay_port;
+    if (!gPortsOrch->getPort(appliance_info.overlay_intf, overlay_port))
+    {
+        SWSS_LOG_ERROR("failed to get port\n");
+        return false;
+    }
+
+    /* Assuming for now that it's a port RIF */
+    sai_object_id_t rule_id = SAI_NULL_OBJECT_ID;
+    sai_attribute_t attr;
+    vector<sai_attribute_t> rule_attrs;
+    attr.id = SAI_ACL_ENTRY_ATTR_TABLE_ID;
+    attr.value.oid = acl_table_id_;
+    rule_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_ENTRY_ATTR_PRIORITY;
+    attr.value.u32 = 999;
+    rule_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_ENTRY_ATTR_ADMIN_STATE;
+    attr.value.booldata = true;
+    rule_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_ENTRY_ATTR_FIELD_IN_PORT;
+    attr.value.aclfield.data.oid = port.m_port_id;
+    rule_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_ENTRY_ATTR_ACTION_REDIRECT;
+    attr.value.aclaction.enable = true;
+    attr.value.aclaction.parameter.oid = overlay_port.m_port_id;
+    rule_attrs.push_back(attr);
+
+    sai_status_t status = sai_acl_api->create_acl_entry(&rule_id,
+                                           gSwitchId,
+                                           (uint32_t)rule_attrs.size(),
+                                           rule_attrs.data());
+    if(status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("failed to create rule\n");
+        return false;
+    }
+
+    return true;
+}
+
+bool VNetApplianceOrch::initAcl(void)
+{
+    SWSS_LOG_ENTER();
+
+    if (acl_table_id_ != SAI_NULL_OBJECT_ID)
+    {
+        return true;
+    }
+
+    vector<sai_attribute_t> table_attrs;
+    sai_attribute_t attr;
+    vector<int32_t> bpoint_list = { SAI_ACL_BIND_POINT_TYPE_PORT, SAI_ACL_BIND_POINT_TYPE_LAG };
+    attr.id = SAI_ACL_TABLE_ATTR_ACL_BIND_POINT_TYPE_LIST;
+    attr.value.s32list.count = static_cast<uint32_t>(bpoint_list.size());
+    attr.value.s32list.list = bpoint_list.data();
+    table_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_TABLE_ATTR_FIELD_IN_PORT;
+    attr.value.booldata = true;
+    table_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_TABLE_ATTR_ACL_STAGE;
+    attr.value.s32 = SAI_ACL_STAGE_INGRESS;
+    table_attrs.push_back(attr);
+
+    attr.id = SAI_ACL_TABLE_ATTR_SIZE;
+    attr.value.u32 = 64;
+    table_attrs.push_back(attr);
+
+    sai_status_t status = sai_acl_api->create_acl_table(&acl_table_id_,
+                                           gSwitchId,
+                                           (uint32_t)table_attrs.size(),
+                                           table_attrs.data());
+
+    if(status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("Failed to create acl table: %d\n", status);
+        return false;
     }
 
     return true;

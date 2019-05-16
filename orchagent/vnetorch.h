@@ -9,12 +9,86 @@
 
 #include "request_parser.h"
 #include "ipaddresses.h"
+#include "directory.h"
 
 #define VNET_BITMAP_SIZE 32
 #define VNET_TUNNEL_SIZE 512
 #define VNET_NEIGHBOR_MAX 0xffff
 
 extern sai_object_id_t gVirtualRouterId;
+extern sai_object_id_t gSwitchId;
+extern Directory<Orch*> gDirectory;
+
+const request_description_t vnet_appliance_description = {
+    { REQ_T_STRING },
+    {
+        { "overlay_interface",  REQ_T_STRING },
+        { "underlay_interface", REQ_T_STRING },
+        { "capability",         REQ_T_STRING },
+        { "weight",             REQ_T_UINT },
+        { "index",              REQ_T_UINT },
+    },
+    { "overlay_interface", "underlay_interface", "index" }
+};
+
+class VNetApplianceRequest : public Request
+{
+public:
+    VNetApplianceRequest() : Request(vnet_appliance_description, ':') { }
+};
+
+struct VNetApplianceInfo
+{
+    sai_object_id_t switch_id;
+    string overlay_intf;
+    string underlay_intf;
+};
+
+class VNetApplianceOrch : public Orch2
+{
+public:
+    typedef map<string, VNetApplianceInfo> ApplianceMap;
+
+    VNetApplianceOrch(DBConnector *db, vector<string> &tableNames);
+
+    inline sai_object_id_t switch_id(string name) const
+    {
+        if (appliances_.find(name) == appliances_.end())
+        {
+            return SAI_NULL_OBJECT_ID;
+        }
+
+        return appliances_.at(name).switch_id;
+    }
+
+    inline sai_object_id_t loopback_rif(string name) const
+    {
+        if (appliances_.find(name) == appliances_.end())
+        {
+            return SAI_NULL_OBJECT_ID;
+        }
+
+        return appliances_.at(name).loopback_rif;
+    }
+
+    bool exists(string name) const
+    {
+        return appliances_.find(name) != appliances_.end();
+    }
+
+    bool redirectPortToOverlay(string appliance, const Port& port);
+
+private:
+    virtual bool addOperation(const Request& request);
+    virtual bool delOperation(const Request& request);
+
+    bool initAcl(void);
+
+    VNetApplianceRequest request_;
+    ApplianceMap appliances_;
+
+    sai_object_id_t acl_table_id_ = SAI_NULL_OBJECT_ID;
+};
 
 const request_description_t vnet_request_description = {
     { REQ_T_STRING },
@@ -24,6 +98,7 @@ const request_description_t vnet_request_description = {
         { "vni",           REQ_T_UINT },
         { "peer_list",     REQ_T_SET },
         { "guid",          REQ_T_STRING },
+        { "appliance",     REQ_T_STRING },
     },
     { "vxlan_tunnel", "vni" } // mandatory attributes
 };
@@ -47,6 +122,7 @@ struct VNetInfo
     string tunnel;
     uint32_t vni;
     set<string> peers;
+    string appliance;
 };
 
 typedef map<VR_TYPE, sai_object_id_t> vrid_list_t;
@@ -70,6 +146,7 @@ class VNetObject
 public:
     VNetObject(const VNetInfo& vnetInfo) :
                tunnel_(vnetInfo.tunnel),
+               appliance_(vnetInfo.appliance),
                peer_list_(vnetInfo.peers),
                vni_(vnetInfo.vni)
                { }
@@ -91,9 +168,26 @@ public:
         return tunnel_;
     }
 
+    string getApplianceName() const
+    {
+        return appliance_;
+    }
+
     uint32_t getVni() const
     {
         return vni_;
+    }
+
+    sai_object_id_t getSwitchId() const
+    {
+        VNetApplianceOrch* appliance_orch = gDirectory.get<VNetApplianceOrch*>();
+
+        if (appliance_.empty())
+        {
+            return gSwitchId;
+        }
+
+        return appliance_orch->switch_id(appliance_);
     }
 
     virtual ~VNetObject() noexcept(false) {};
@@ -101,6 +195,7 @@ public:
 private:
     set<string> peer_list_ = {};
     string tunnel_;
+    string appliance_;
     uint32_t vni_;
 };
 

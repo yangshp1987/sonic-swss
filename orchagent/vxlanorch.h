@@ -8,6 +8,9 @@
 #include "portsorch.h"
 #include "vrforch.h"
 
+extern sai_object_id_t gSwitchId;
+extern sai_object_id_t  gUnderlayIfId;
+
 enum class MAP_T
 {
     MAP_TO_INVALID,
@@ -25,6 +28,8 @@ struct tunnel_ids_t
     sai_object_id_t tunnel_decap_id;
     sai_object_id_t tunnel_id;
     sai_object_id_t tunnel_term_id;
+    sai_object_id_t switch_id;
+    sai_object_id_t underlay_rif;
 };
 
 struct nh_key_t
@@ -75,11 +80,27 @@ class VxlanTunnel
 {
 public:
     VxlanTunnel(string name, IpAddress srcIp, IpAddress dstIp)
-                :tunnel_name_(name), src_ip_(srcIp), dst_ip_(dstIp) { }
+                :tunnel_name_(name), src_ip_(srcIp), dst_ip_(dstIp)
+    {
+        ids_.switch_id = gSwitchId;
+        ids_.underlay_rif = gUnderlayIfId;
+    }
 
     bool isActive() const
     {
         return active_;
+    }
+
+    bool setSwitch(sai_object_id_t switch_id, sai_object_id_t underlay_rif)
+    {
+        if (isActive())
+        {
+            return false;
+        }
+
+        ids_.switch_id = switch_id;
+        ids_.underlay_rif = underlay_rif;
+        return true;
     }
 
     bool createTunnel(MAP_T encap, MAP_T decap);
@@ -102,6 +123,16 @@ public:
     sai_object_id_t getEncapMapId() const
     {
         return ids_.tunnel_encap_id;
+    }
+
+    sai_object_id_t getSwitchId() const
+    {
+        return ids_.switch_id;
+    }
+
+    sai_object_id_t getUnderlayRifId() const
+    {
+        return ids_.underlay_rif;
     }
 
     void updateNextHop(IpAddress& ipAddr, MacAddress macAddress, uint32_t vni, sai_object_id_t nhId);

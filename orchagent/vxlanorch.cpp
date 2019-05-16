@@ -16,13 +16,11 @@
 #include "swssnet.h"
 
 /* Global variables */
-extern sai_object_id_t gSwitchId;
 extern sai_object_id_t gVirtualRouterId;
 extern sai_tunnel_api_t *sai_tunnel_api;
 extern sai_next_hop_api_t *sai_next_hop_api;
 extern Directory<Orch*> gDirectory;
 extern PortsOrch*       gPortsOrch;
-extern sai_object_id_t  gUnderlayIfId;
 
 const map<MAP_T, uint32_t> vxlanTunnelMap =
 {
@@ -75,7 +73,7 @@ static inline uint32_t tunnel_map_val (MAP_T map_t)
 }
 
 static sai_object_id_t
-create_tunnel_map(MAP_T map_t)
+create_tunnel_map(sai_object_id_t switch_id, MAP_T map_t)
 {
     sai_attribute_t attr;
     std::vector<sai_attribute_t> tunnel_map_attrs;
@@ -94,7 +92,7 @@ create_tunnel_map(MAP_T map_t)
     sai_object_id_t tunnel_map_id;
     sai_status_t status = sai_tunnel_api->create_tunnel_map(
                                 &tunnel_map_id,
-                                gSwitchId,
+                                switch_id,
                                 static_cast<uint32_t>(tunnel_map_attrs.size()),
                                 tunnel_map_attrs.data()
                           );
@@ -109,6 +107,7 @@ create_tunnel_map(MAP_T map_t)
 static sai_object_id_t create_tunnel_map_entry(
     MAP_T map_t,
     sai_object_id_t tunnel_map_id,
+    sai_object_id_t switch_id,
     sai_uint32_t vni,
     sai_uint16_t vlan_id,
     sai_object_id_t obj_id=SAI_NULL_OBJECT_ID,
@@ -143,7 +142,7 @@ static sai_object_id_t create_tunnel_map_entry(
     attr.value.u32 = vni;
     tunnel_map_entry_attrs.push_back(attr);
 
-    sai_status_t status = sai_tunnel_api->create_tunnel_map_entry(&tunnel_map_entry_id, gSwitchId,
+    sai_status_t status = sai_tunnel_api->create_tunnel_map_entry(&tunnel_map_entry_id, switch_id,
                                             static_cast<uint32_t> (tunnel_map_entry_attrs.size()),
                                             tunnel_map_entry_attrs.data());
 
@@ -175,6 +174,7 @@ static sai_status_t create_nexthop_tunnel(
     sai_uint32_t vni, // optional vni
     sai_mac_t *mac, // inner destination mac
     sai_object_id_t tunnel_id,
+    sai_object_id_t switch_id,
     sai_object_id_t *next_hop_id)
 {
     std::vector<sai_attribute_t> next_hop_attrs;
@@ -206,7 +206,7 @@ static sai_status_t create_nexthop_tunnel(
         next_hop_attrs.push_back(next_hop_attr);
     }
 
-    sai_status_t status = sai_next_hop_api->create_next_hop(next_hop_id, gSwitchId,
+    sai_status_t status = sai_next_hop_api->create_next_hop(next_hop_id, switch_id,
                                             static_cast<uint32_t>(next_hop_attrs.size()),
                                             next_hop_attrs.data());
     return status;
@@ -217,6 +217,7 @@ static sai_object_id_t
 create_tunnel(
     sai_object_id_t tunnel_encap_id,
     sai_object_id_t tunnel_decap_id,
+    sai_object_id_t switch_id,
     sai_ip_address_t *src_ip,
     sai_object_id_t underlay_rif)
 {
@@ -257,7 +258,7 @@ create_tunnel(
     sai_object_id_t tunnel_id;
     sai_status_t status = sai_tunnel_api->create_tunnel(
                                 &tunnel_id,
-                                gSwitchId,
+                                switch_id,
                                 static_cast<uint32_t>(tunnel_attrs.size()),
                                 tunnel_attrs.data()
                           );
@@ -273,6 +274,7 @@ create_tunnel(
 static sai_object_id_t
 create_tunnel_termination(
     sai_object_id_t tunnel_oid,
+    sai_object_id_t switch_id,
     sai_ip_address_t srcip,
     sai_ip_address_t *dstip,
     sai_object_id_t default_vrid)
@@ -316,7 +318,7 @@ create_tunnel_termination(
     sai_object_id_t term_table_id;
     sai_status_t status = sai_tunnel_api->create_tunnel_term_table_entry(
                                 &term_table_id,
-                                gSwitchId,
+                                switch_id,
                                 static_cast<uint32_t>(tunnel_attrs.size()),
                                 tunnel_attrs.data()
                           );
@@ -340,15 +342,15 @@ bool VxlanTunnel::createTunnel(MAP_T encap, MAP_T decap)
 
         if (decap != MAP_T::MAP_TO_INVALID)
         {
-            ids_.tunnel_decap_id = create_tunnel_map(decap);
+            ids_.tunnel_decap_id = create_tunnel_map(ids_.switch_id, decap);
         }
         if (encap != MAP_T::MAP_TO_INVALID)
         {
-            ids_.tunnel_encap_id = create_tunnel_map(encap);
+            ids_.tunnel_encap_id = create_tunnel_map(ids_.switch_id, encap);
             ip = &ips;
         }
 
-        ids_.tunnel_id = create_tunnel(ids_.tunnel_encap_id, ids_.tunnel_decap_id, ip, gUnderlayIfId);
+        ids_.tunnel_id = create_tunnel(ids_.tunnel_encap_id, ids_.tunnel_decap_id, ids_.switch_id, ip, ids_.underlay_rif);
 
         ip = nullptr;
         if (!dst_ip_.isZero())
@@ -357,7 +359,7 @@ bool VxlanTunnel::createTunnel(MAP_T encap, MAP_T decap)
             ip = &ipd;
         }
 
-        ids_.tunnel_term_id = create_tunnel_termination(ids_.tunnel_id, ips, ip, gVirtualRouterId);
+        ids_.tunnel_term_id = create_tunnel_termination(ids_.tunnel_id, ids_.switch_id, ips, ip, gVirtualRouterId);
         active_ = true;
         tunnel_map_ = { encap, decap };
     }
@@ -376,14 +378,14 @@ sai_object_id_t VxlanTunnel::addEncapMapperEntry(sai_object_id_t obj, uint32_t v
 {
     const auto encap_id = getEncapMapId();
     const auto map_t = tunnel_map_.first;
-    return create_tunnel_map_entry(map_t, encap_id, vni, 0, obj, true);
+    return create_tunnel_map_entry(map_t, encap_id, ids_.switch_id, vni, 0, obj, true);
 }
 
 sai_object_id_t VxlanTunnel::addDecapMapperEntry(sai_object_id_t obj, uint32_t vni)
 {
     const auto decap_id = getDecapMapId();
     const auto map_t = tunnel_map_.second;
-    return create_tunnel_map_entry(map_t, decap_id, vni, 0, obj);
+    return create_tunnel_map_entry(map_t, decap_id, ids_.switch_id, vni, 0, obj);
 }
 
 void VxlanTunnel::insertMapperEntry(sai_object_id_t encap, sai_object_id_t decap, uint32_t vni)
@@ -483,7 +485,7 @@ VxlanTunnelOrch::createNextHopTunnel(string tunnelName, IpAddress& ipAddr, MacAd
     }
 
     auto tunnel_obj = getVxlanTunnel(tunnelName);
-    sai_object_id_t nh_id, tunnel_id = tunnel_obj->getTunnelId();
+    sai_object_id_t nh_id, tunnel_id = tunnel_obj->getTunnelId(), switch_id = tunnel_obj->getSwitchId();
 
     if ((nh_id = tunnel_obj->getNextHop(ipAddr, macAddress, vni)) != SAI_NULL_OBJECT_ID)
     {
@@ -501,7 +503,7 @@ VxlanTunnelOrch::createNextHopTunnel(string tunnelName, IpAddress& ipAddr, MacAd
         macptr = &mac;
     }
 
-    if (create_nexthop_tunnel(host_ip, vni, macptr, tunnel_id, &nh_id) != SAI_STATUS_SUCCESS)
+    if (create_nexthop_tunnel(host_ip, vni, macptr, tunnel_id, switch_id, &nh_id) != SAI_STATUS_SUCCESS)
     {
         string err_msg = "NH tunnel create failed for " + ipAddr.to_string() + " " + to_string(vni);
         throw std::runtime_error(err_msg);
@@ -714,11 +716,12 @@ bool VxlanTunnelMapOrch::addOperation(const Request& request)
 
     const auto tunnel_map_id = tunnel_obj->getDecapMapId();
     const auto tunnel_map_entry_name = request.getKeyString(1);
+    const auto switch_id = tunnel_obj->getSwitchId();
 
     try
     {
         auto tunnel_map_entry_id = create_tunnel_map_entry(MAP_T::VNI_TO_VLAN_ID,
-                                                           tunnel_map_id, vni_id, vlan_id);
+                                                           tunnel_map_id, switch_id, vni_id, vlan_id);
         vxlan_tunnel_map_table_[full_tunnel_map_entry_name] = tunnel_map_entry_id;
     }
     catch(const std::runtime_error& error)

@@ -9,6 +9,8 @@
 #define SAI_SWITCH_ATTR_CUSTOM_RANGE_BASE SAI_SWITCH_ATTR_CUSTOM_RANGE_START
 #include "sairedis.h"
 
+#define  APP_VNET_APPLIANCE_TABLE_NAME "VNET_APPLIANCE_TABLE"
+
 using namespace std;
 using namespace swss;
 
@@ -78,17 +80,22 @@ bool OrchDaemon::init()
             APP_VNET_RT_TUNNEL_TABLE_NAME
     };
     VNetOrch *vnet_orch;
-    if (platform == MLNX_PLATFORM_SUBSTRING)
-    {
-        vnet_orch = new VNetOrch(m_applDb, APP_VNET_TABLE_NAME, VNET_EXEC::VNET_EXEC_BRIDGE);
-    }
-    else
-    {
+    /* if (platform == MLNX_PLATFORM_SUBSTRING) */
+    /* { */
+    /*     vnet_orch = new VNetOrch(m_applDb, APP_VNET_TABLE_NAME, VNET_EXEC::VNET_EXEC_BRIDGE); */
+    /* } */
+    /* else */
+    /* { */
         vnet_orch = new VNetOrch(m_applDb, APP_VNET_TABLE_NAME);
-    }
+    /* } */
     gDirectory.set(vnet_orch);
     VNetRouteOrch *vnet_rt_orch = new VNetRouteOrch(m_applDb, vnet_tables, vnet_orch);
     gDirectory.set(vnet_rt_orch);
+    vector<string> vnet_appliance_tables = {
+            APP_VNET_APPLIANCE_TABLE_NAME,
+    };
+    VNetApplianceOrch *vnet_appliance_orch = new VNetApplianceOrch(m_applDb, vnet_appliance_tables);
+    gDirectory.set(vnet_appliance_orch);
     VRFOrch *vrf_orch = new VRFOrch(m_applDb, APP_VRF_TABLE_NAME);
     gDirectory.set(vrf_orch);
 
@@ -199,6 +206,7 @@ bool OrchDaemon::init()
     m_orchList.push_back(mirror_orch);
     m_orchList.push_back(gAclOrch);
     m_orchList.push_back(vnet_orch);
+    m_orchList.push_back(vnet_appliance_orch);
     m_orchList.push_back(vnet_rt_orch);
     m_orchList.push_back(vrf_orch);
     m_orchList.push_back(vxlan_tunnel_orch);

@@ -1909,7 +1909,7 @@ bool VNetApplianceOrch::addOperation(const Request& request)
     attrs.push_back(attr);
 
     status = sai_router_intfs_api->create_router_interface(
-            &info.underlay_rif_id,
+            &info.loopback_rif_id,
             info.switch_id,
             (uint32_t)attrs.size(),
             attrs.data());

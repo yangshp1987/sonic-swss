@@ -40,6 +40,8 @@ public:
 struct VNetApplianceInfo
 {
     sai_object_id_t switch_id;
+    sai_object_id_t loopback_rif_id;
+    sai_object_id_t virtual_router_id;
     string overlay_intf;
     string underlay_intf;
 };
@@ -68,7 +70,7 @@ public:
             return SAI_NULL_OBJECT_ID;
         }
 
-        return appliances_.at(name).loopback_rif;
+        return appliances_.at(name).loopback_rif_id;
     }
 
     bool exists(string name) const

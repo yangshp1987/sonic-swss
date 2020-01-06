@@ -352,6 +352,10 @@ void FdbOrch::doTask(NotificationConsumer& consumer)
     std::string op;
     std::string data;
     std::vector<swss::FieldValueTuple> values;
+    string alias;
+    string vlan;
+    Port port;
+    Port vlanPort;
 
     consumer.pop(op, data, values);
 
@@ -373,14 +377,120 @@ void FdbOrch::doTask(NotificationConsumer& consumer)
         }
         else if (op == "PORT")
         {
+            sai_attribute_t flush_attr[2];
+            alias = data;
             /*place holder for flush port fdb*/
-            SWSS_LOG_ERROR("Received unsupported flush port fdb request");
+            if (alias.empty())
+            {
+                SWSS_LOG_ERROR("Receive wrong port to flush fdb!");
+                return;
+            }
+            if (!gPortsOrch->getPort(alias, port))
+            {
+                SWSS_LOG_ERROR("Get Port from port(%s) failed!", alias.c_str());
+                return;
+            }
+            if (port.m_bridge_port_id == SAI_NULL_OBJECT_ID)
+            {
+                return;
+            }
+            memset(flush_attr,0, sizeof(flush_attr));
+            flush_attr[0].id = SAI_FDB_FLUSH_ATTR_BRIDGE_PORT_ID;
+            flush_attr[0].value.oid = port.m_bridge_port_id;
+            flush_attr[1].id = SAI_FDB_FLUSH_ATTR_ENTRY_TYPE;
+            flush_attr[1].value.s32 = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
+            status = sai_fdb_api->flush_fdb_entries(gSwitchId, 2,
+                                            (const sai_attribute_t*)flush_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("Failed to clear fdb by port(%s, id:0x%lx). status = %d",
+                               alias.c_str(), port.m_bridge_port_id, status);
+                return;
+            }
+            SWSS_LOG_NOTICE("Clear fdb by port(%s)", alias.c_str());
             return;
         }
         else if (op == "VLAN")
         {
+            sai_attribute_t flush_attr[2];
+            vlan = data;
             /*place holder for flush vlan fdb*/
-            SWSS_LOG_ERROR("Received unsupported flush vlan fdb request");
+            if (vlan.empty())
+            {
+                SWSS_LOG_ERROR("Receive wrong vlan to flush fdb!");
+                return;
+            }
+            if (!gPortsOrch->getPort(vlan, vlanPort))
+            {
+                SWSS_LOG_ERROR("Get Port from vlan(%s) failed!", vlan.c_str());
+                return;
+            }
+            if (vlanPort.m_vlan_info.vlan_oid == SAI_NULL_OBJECT_ID)
+            {
+                return;
+            }
+            memset(flush_attr,0, sizeof(flush_attr));
+            flush_attr[0].id = SAI_FDB_FLUSH_ATTR_BV_ID;
+            flush_attr[0].value.oid = vlanPort.m_vlan_info.vlan_oid;
+            flush_attr[1].id = SAI_FDB_FLUSH_ATTR_ENTRY_TYPE;
+            flush_attr[1].value.s32 = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
+            status = sai_fdb_api->flush_fdb_entries(gSwitchId, 2,
+                                            (const sai_attribute_t*)flush_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("Failed to clear fdb by vlan(%s, id:0x%lx). status = %d",
+                               vlan.c_str(), vlanPort.m_vlan_info.vlan_oid, status);
+                return;
+            }
+            SWSS_LOG_NOTICE("Clear fdb by vlan(%s)", vlan.c_str());
+            return;
+        }
+        else if (op == "PORTVLAN")
+        {
+            sai_attribute_t flush_attr[3];
+            size_t found = data.find('|');
+            if (found != string::npos)
+            {
+                alias = data.substr(0, found);
+                vlan = data.substr(found+1);
+            }
+            if (alias.empty() || vlan.empty())
+            {
+                SWSS_LOG_ERROR("Receive wrong port or vlan to flush fdb!");
+                return;
+            }
+            if (!gPortsOrch->getPort(alias, port))
+            {
+                SWSS_LOG_ERROR("Get Port from port(%s) failed!", alias.c_str());
+                return;
+            }
+            if (!gPortsOrch->getPort(vlan, vlanPort))
+            {
+                SWSS_LOG_ERROR("Get Port from vlan(%s) failed!", vlan.c_str());
+                return;
+            }
+            if (port.m_bridge_port_id == SAI_NULL_OBJECT_ID ||
+                vlanPort.m_vlan_info.vlan_oid == SAI_NULL_OBJECT_ID)
+            {
+                return;
+            }
+            memset(flush_attr,0, sizeof(flush_attr));
+            flush_attr[0].id = SAI_FDB_FLUSH_ATTR_BRIDGE_PORT_ID;
+            flush_attr[0].value.oid = port.m_bridge_port_id;
+            flush_attr[1].id = SAI_FDB_FLUSH_ATTR_BV_ID;
+            flush_attr[1].value.oid = vlanPort.m_vlan_info.vlan_oid;
+            flush_attr[2].id = SAI_FDB_FLUSH_ATTR_ENTRY_TYPE;
+            flush_attr[2].value.s32 = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
+            status = sai_fdb_api->flush_fdb_entries(gSwitchId, 3,
+                                        (const sai_attribute_t*)flush_attr);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("Failed to clear fdb by port(%s, 0x%lx)+vlan(%s, 0x%lx). status = %d",
+                               alias.c_str(), port.m_bridge_port_id, vlan.c_str(),
+                               vlanPort.m_vlan_info.vlan_oid, status);
+                return;
+            }
+            SWSS_LOG_NOTICE("Clear fdb by port(%s)+vlan(%s)", alias.c_str(), vlan.c_str());
             return;
         }
         else
